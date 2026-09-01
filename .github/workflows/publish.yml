@@ -1,0 +1,42 @@
+name: Publish
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  # Trusted publishing: npm mints a short-lived credential from this job's
+  # OIDC token, so no NPM_TOKEN secret exists in this repo. The counterpart
+  # lives on npmjs.com, where this repo and workflow file are registered as
+  # the package's trusted publisher.
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      # Trusted publishing needs npm 11.5.1 or newer; node 24 may ship older.
+      - name: update npm
+        run: npm install -g npm@latest
+
+      - name: fail if the tag does not match package.json
+        run: |
+          pkg="$(node -p "require('./package.json').version")"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$pkg" != "$tag" ]; then
+            echo "::error::tag v$tag does not match package.json version $pkg"
+            exit 1
+          fi
+
+      - name: publish
+        run: npm publish
