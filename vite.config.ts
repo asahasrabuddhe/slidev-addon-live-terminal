@@ -77,13 +77,25 @@ function ptyServer(): Plugin {
         const shell = process.env.SHELL || 'zsh'
         const args = cmd ? ['-l', '-c', cmd] : ['-l']
 
-        const ptyProc = spawn(shell, args, {
-          name: 'xterm-256color',
-          cols,
-          rows,
-          cwd,
-          env: process.env as Record<string, string>,
-        })
+        // A failed spawn must not take the whole dev server down; report it
+        // into the terminal (binary output frame) and close like an exit.
+        let ptyProc: ReturnType<typeof spawn>
+        try {
+          ptyProc = spawn(shell, args, {
+            name: 'xterm-256color',
+            cols,
+            rows,
+            cwd,
+            env: process.env as Record<string, string>,
+          })
+        } catch (err) {
+          try {
+            ws.send(Buffer.from(`failed to spawn ${shell}: ${err instanceof Error ? err.message : err}\r\n`))
+            ws.send(JSON.stringify({ type: 'exit', exitCode: -1 }))
+            ws.close()
+          } catch {}
+          return
+        }
         livePtys.add(ptyProc)
         let killed = false
         const killPty = () => {

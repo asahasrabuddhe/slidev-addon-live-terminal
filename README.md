@@ -53,3 +53,15 @@ While presenting: `f` swaps to the recording, `r` restarts an exited process.
   component shows the cast if one is given, otherwise a styled placeholder.
 - The `/__pty` endpoint executes commands as you, on your machine, dev-server
   only. It rejects cross-origin WebSocket upgrades.
+
+## Troubleshooting
+
+**`failed to spawn /bin/zsh: posix_spawnp failed.`** node-pty's install
+scripts did not run, so its `spawn-helper` binary lost its execute bit. This
+happens when npm blocks install scripts (`allow-scripts`). Fix:
+
+```bash
+chmod +x node_modules/node-pty/prebuilds/darwin-*/spawn-helper
+```
+
+or approve node-pty's scripts and reinstall.

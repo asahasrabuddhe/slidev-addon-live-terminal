@@ -93,15 +93,23 @@ async function initTerm() {
   term.loadAddon(fitAddon)
   term.open(host.value)
   fitAddon.fit()
+  term.focus()
 
   term.onData(d => sendJson({ type: 'input', data: d }))
   term.onResize(({ cols, rows }) => sendJson({ type: 'resize', cols, rows }))
 
   resizeObserver = new ResizeObserver(() => {
     clearTimeout(resizeTimer)
-    resizeTimer = setTimeout(() => fitAddon?.fit(), 50)
+    resizeTimer = setTimeout(() => refit(), 50)
   })
   resizeObserver.observe(host.value)
+}
+
+// Never fit against a hidden host: under v-show (cast toggled in) the box is
+// 0x0 and FitAddon would squeeze the PTY down to a few columns.
+function refit() {
+  if (host.value && host.value.clientWidth > 0 && host.value.clientHeight > 0)
+    fitAddon?.fit()
 }
 
 function sendJson(msg: Record<string, unknown>) {
@@ -209,6 +217,15 @@ async function mountCast() {
 }
 
 watch([activeMode, () => props.cast], mountCast, { flush: 'post' })
+
+// Coming back from the cast: the box regains its size, so refit and put the
+// keyboard back in the terminal.
+watch(showLive, (live) => {
+  if (live && term) {
+    refit()
+    term.focus()
+  }
+}, { flush: 'post' })
 
 // Gated on isActive, unlike Frame.vue's global listener: a deck can hold
 // several LiveTerminals, and an ungated listener would toggle off-screen ones.
