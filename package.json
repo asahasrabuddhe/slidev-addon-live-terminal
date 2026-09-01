@@ -1,6 +1,6 @@
 {
   "name": "slidev-addon-live-terminal",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A live interactive terminal (xterm.js + node-pty) inside Slidev slides, with an asciinema cast fallback",
   "keywords": [
     "slidev-addon",

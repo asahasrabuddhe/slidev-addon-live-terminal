@@ -72,10 +72,15 @@ function cssVar(name: string, fallback: string) {
 // xterm is imported lazily so PROD builds never load it and it lands in a
 // chunk fetched only when a live terminal actually initializes.
 async function initTerm() {
-  const [{ Terminal }, { FitAddon }] = await Promise.all([
-    import('@xterm/xterm'),
-    import('@xterm/addon-fit'),
+  // Both packages ship CJS builds, and the interop shape depends on how the
+  // consumer's bundler resolved this component (symlinked source vs a
+  // pre-bundled node_modules dep), so look for the classes in both places.
+  const [xtermMod, fitMod] = await Promise.all([
+    import('@xterm/xterm') as Promise<any>,
+    import('@xterm/addon-fit') as Promise<any>,
   ])
+  const Terminal = xtermMod.Terminal ?? xtermMod.default?.Terminal
+  const FitAddon = fitMod.FitAddon ?? fitMod.default?.FitAddon
   await import('@xterm/xterm/css/xterm.css')
   if (!host.value)
     return
@@ -238,9 +243,10 @@ async function mountCast() {
   player = undefined
   if (activeMode.value !== 'cast' || !props.cast || !castHost.value)
     return
-  const AsciinemaPlayer = await import('asciinema-player')
+  const playerMod: any = await import('asciinema-player')
+  const create = playerMod.create ?? playerMod.default?.create
   await import('asciinema-player/dist/bundle/asciinema-player.css')
-  player = AsciinemaPlayer.create(props.cast, castHost.value, {
+  player = create(props.cast, castHost.value, {
     autoPlay: true,
     loop: true,
     controls: false,

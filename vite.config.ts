@@ -248,5 +248,12 @@ function ptyServer(): Plugin {
 }
 
 export default defineConfig({
+  // LiveTerminal.vue lives in the consumer's node_modules, so Vite's dep
+  // scanner never sees its dynamic imports. Without this, @xterm/xterm (a CJS
+  // build) is served raw to the browser and exports nothing. Forcing the
+  // client deps through prebundling gives them proper ESM interop.
+  optimizeDeps: {
+    include: ['@xterm/xterm', '@xterm/addon-fit', 'asciinema-player'],
+  },
   plugins: [ptyServer()],
 })
