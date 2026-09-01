@@ -13,6 +13,11 @@ const props = withDefaults(defineProps<{
   rows?: number
   cwd?: string
   autoConnect?: boolean
+  // Sessions are shared by (cwd, cmd): every terminal pointing at the same
+  // command attaches to the same server-side PTY, which is what keeps the
+  // presenter tab and the audience tab in sync. Set sid to force a separate
+  // session for the same command.
+  sid?: string
 }>(), {
   cmd: '',
   mode: 'live',
@@ -150,6 +155,8 @@ function connect() {
   let url = `${proto}://${location.host}/__pty?cmd=${encodeURIComponent(props.cmd)}&cols=${term.cols}&rows=${term.rows}`
   if (props.cwd)
     url += `&cwd=${encodeURIComponent(props.cwd)}`
+  if (props.sid)
+    url += `&sid=${encodeURIComponent(props.sid)}`
 
   ws = new WebSocket(url)
   ws.binaryType = 'arraybuffer'
@@ -160,6 +167,11 @@ function connect() {
       if (msg.type === 'exit') {
         exited.value = true
         term?.write(`\r\n\x1b[2m[process exited (code ${msg.exitCode}), press r or click to restart]\x1b[0m`)
+      } else if (msg.type === 'restart') {
+        // Another tab attached to the same session respawned it.
+        exited.value = false
+        disconnected.value = false
+        term?.reset()
       }
       return
     }

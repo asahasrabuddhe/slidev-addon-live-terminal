@@ -3,11 +3,31 @@ import { defineConfig, type Plugin } from 'vite'
 // Dev-server half of the live-terminal addon: a WebSocket endpoint at /__pty
 // that spawns real PTYs. See PROTOCOL.md for the wire contract.
 //
+// Sessions are shared: every connection carries a session id (derived from the
+// command it wants), and connections with the same id attach to the same PTY.
+// That is what makes the presenter tab and the audience tab show the same
+// shell, and what keeps a session's scrollback alive while the presenter
+// navigates between slides. A session only dies when its process exits, when
+// it has had no clients for LINGER_MS, or when the dev server stops.
+//
 // `ws` and `node-pty` are loaded lazily inside configureServer, never at the
 // top of this file. vite.config.ts is also evaluated by `slidev build` and
 // `slidev export`, and node-pty is a native module whose install can break
 // (wrong Node ABI, missing toolchain). `apply: 'serve'` keeps the hook out of
 // builds; the lazy imports keep a broken node-pty from breaking module load.
+
+const LINGER_MS = 30 * 60 * 1000
+const BUFFER_CAP = 256 * 1024
+
+interface Session {
+  pty: any
+  clients: Set<any>
+  buffer: string[]
+  bufBytes: number
+  dead: boolean
+  lingerTimer?: ReturnType<typeof setTimeout>
+}
+
 function ptyServer(): Plugin {
   return {
     name: 'pty-server',
@@ -21,7 +41,25 @@ function ptyServer(): Plugin {
         ptyMod.spawn ?? ptyMod.default?.spawn
 
       const wss = new WebSocketServer({ noServer: true })
-      const livePtys = new Set<{ kill: () => void }>()
+      const sessions = new Map<string, Session>()
+
+      const destroySession = (sid: string) => {
+        const s = sessions.get(sid)
+        if (!s)
+          return
+        sessions.delete(sid)
+        clearTimeout(s.lingerTimer)
+        if (!s.dead) {
+          try {
+            s.pty.kill()
+          } catch {}
+        }
+        for (const c of s.clients) {
+          try {
+            c.close()
+          } catch {}
+        }
+      }
 
       server.httpServer?.on('upgrade', (req, socket, head) => {
         const url = new URL(req.url ?? '', 'http://localhost')
@@ -61,101 +99,149 @@ function ptyServer(): Plugin {
       //     { type: 'input', data: '<utf-8 keystrokes>' }
       //     { type: 'resize', cols: <int>, rows: <int> }
       //   server -> client:
-      //     binary frames: raw PTY output bytes
-      //     text frames: JSON control, only { type: 'exit', exitCode: <int> },
-      //       after which the server closes the socket
+      //     binary frames: raw PTY output bytes (attaching clients first get
+      //       the session's buffered scrollback the same way)
+      //     text frames: JSON control
+      //       { type: 'exit', exitCode: <int> }  process exited; socket stays
+      //         open so a restart can reuse it
+      //       { type: 'restart' }                another client respawned the
+      //         session; reset the terminal, new output follows
       wss.on('connection', (ws: any, req: any) => {
         const url = new URL(req.url ?? '', 'http://localhost')
         const cmd = url.searchParams.get('cmd') ?? ''
         const cols = parseInt(url.searchParams.get('cols') ?? '', 10) || 80
         const rows = parseInt(url.searchParams.get('rows') ?? '', 10) || 24
         const cwd = url.searchParams.get('cwd') || server.config.root
+        const sid = url.searchParams.get('sid') || `${cwd}|${cmd}`
 
-        // Running through `$SHELL -l -c "<cmd>"` sidesteps arg-splitting on
-        // the server and inherits the presenter's login environment (PATH,
-        // version managers, aliases from login rc files).
-        const shell = process.env.SHELL || 'zsh'
-        const args = cmd ? ['-l', '-c', cmd] : ['-l']
-
-        // A failed spawn must not take the whole dev server down; report it
-        // into the terminal (binary output frame) and close like an exit.
-        let ptyProc: ReturnType<typeof spawn>
-        try {
-          ptyProc = spawn(shell, args, {
+        const spawnPty = () => {
+          // Running through `$SHELL -l -c "<cmd>"` sidesteps arg-splitting on
+          // the server and inherits the presenter's login environment (PATH,
+          // version managers, aliases from login rc files).
+          const shell = process.env.SHELL || 'zsh'
+          const args = cmd ? ['-l', '-c', cmd] : ['-l']
+          return spawn(shell, args, {
             name: 'xterm-256color',
             cols,
             rows,
             cwd,
             env: process.env as Record<string, string>,
           })
-        } catch (err) {
-          try {
-            ws.send(Buffer.from(`failed to spawn ${shell}: ${err instanceof Error ? err.message : err}\r\n`))
-            ws.send(JSON.stringify({ type: 'exit', exitCode: -1 }))
-            ws.close()
-          } catch {}
-          return
-        }
-        livePtys.add(ptyProc)
-        let killed = false
-        const killPty = () => {
-          if (killed) return
-          killed = true
-          livePtys.delete(ptyProc)
-          try {
-            ptyProc.kill()
-          } catch {}
         }
 
-        // PTY output goes out as binary frames; onData yields strings, and
-        // Buffer.from makes ws send binary, which is how the client tells raw
-        // output apart from JSON control (text) frames.
-        ptyProc.onData((data: string) => {
-          if (ws.readyState === ws.OPEN) ws.send(Buffer.from(data))
-        })
+        const wire = (s: Session) => {
+          // PTY output goes out as binary frames; onData yields strings, and
+          // Buffer.from makes ws send binary, which is how the client tells
+          // raw output apart from JSON control (text) frames.
+          s.pty.onData((data: string) => {
+            s.buffer.push(data)
+            s.bufBytes += data.length
+            while (s.bufBytes > BUFFER_CAP && s.buffer.length > 1)
+              s.bufBytes -= s.buffer.shift()!.length
+            for (const c of s.clients) {
+              if (c.readyState === c.OPEN) c.send(Buffer.from(data))
+            }
+          })
+          s.pty.onExit(({ exitCode }: { exitCode: number }) => {
+            s.dead = true
+            for (const c of s.clients) {
+              try {
+                c.send(JSON.stringify({ type: 'exit', exitCode }))
+              } catch {}
+            }
+          })
+        }
 
-        ptyProc.onExit(({ exitCode }: { exitCode: number }) => {
-          killed = true
-          livePtys.delete(ptyProc)
+        let session = sessions.get(sid)
+        if (!session) {
+          let pty
           try {
-            ws.send(JSON.stringify({ type: 'exit', exitCode }))
-          } catch {}
+            pty = spawnPty()
+          } catch (err) {
+            // A failed spawn must not take the whole dev server down; report
+            // it into the terminal and close like an exit.
+            try {
+              ws.send(Buffer.from(`failed to spawn: ${err instanceof Error ? err.message : err}\r\n`))
+              ws.send(JSON.stringify({ type: 'exit', exitCode: -1 }))
+              ws.close()
+            } catch {}
+            return
+          }
+          session = { pty, clients: new Set(), buffer: [], bufBytes: 0, dead: false }
+          sessions.set(sid, session)
+          wire(session)
+        } else if (session.dead) {
+          // The process exited and a client reconnected: respawn in place and
+          // tell everyone else still attached to reset their terminal.
           try {
-            ws.close()
-          } catch {}
-        })
+            session.pty = spawnPty()
+          } catch (err) {
+            try {
+              ws.send(Buffer.from(`failed to spawn: ${err instanceof Error ? err.message : err}\r\n`))
+              ws.send(JSON.stringify({ type: 'exit', exitCode: -1 }))
+              ws.close()
+            } catch {}
+            return
+          }
+          session.dead = false
+          session.buffer = []
+          session.bufBytes = 0
+          wire(session)
+          for (const c of session.clients) {
+            try {
+              c.send(JSON.stringify({ type: 'restart' }))
+            } catch {}
+          }
+        }
+
+        const s = session
+        clearTimeout(s.lingerTimer)
+        s.clients.add(ws)
+
+        // Late joiners (the audience tab, a slide revisited) get the
+        // scrollback replayed before the live stream continues.
+        if (s.buffer.length)
+          ws.send(Buffer.from(s.buffer.join('')))
 
         ws.on('message', (raw: unknown, isBinary: boolean) => {
           if (isBinary) return
           try {
             const msg = JSON.parse(String(raw))
+            if (s.dead) return
             if (msg.type === 'input' && typeof msg.data === 'string') {
-              ptyProc.write(msg.data)
+              s.pty.write(msg.data)
             } else if (msg.type === 'resize') {
               const c = Number(msg.cols)
               const r = Number(msg.rows)
               if (Number.isInteger(c) && Number.isInteger(r) && c > 0 && r > 0) {
                 try {
-                  ptyProc.resize(c, r)
+                  s.pty.resize(c, r)
                 } catch {}
               }
             }
           } catch {} // ignore malformed frames
         })
 
-        ws.on('close', killPty)
-        ws.on('error', killPty)
+        const detach = () => {
+          s.clients.delete(ws)
+          if (s.clients.size === 0) {
+            if (s.dead) {
+              destroySession(sid)
+            } else {
+              clearTimeout(s.lingerTimer)
+              s.lingerTimer = setTimeout(() => destroySession(sid), LINGER_MS)
+            }
+          }
+        }
+        ws.on('close', detach)
+        ws.on('error', detach)
       })
 
       // Vite restarts the server when this config file changes; kill any
       // shells still running so restarts don't leak processes.
       server.httpServer?.on('close', () => {
-        for (const p of livePtys) {
-          try {
-            p.kill()
-          } catch {}
-        }
-        livePtys.clear()
+        for (const sid of [...sessions.keys()])
+          destroySession(sid)
       })
     },
   }
