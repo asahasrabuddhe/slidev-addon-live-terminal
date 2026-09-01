@@ -37,6 +37,10 @@ Client → server: **text** frames, JSON:
 
 - `{ "type": "input", "data": "<utf-8 keystrokes>" }`
 - `{ "type": "resize", "cols": <int>, "rows": <int> }`
+- `{ "type": "scroll", "ypos": <int> }` — viewport scrolled; relayed verbatim
+  to the session's other clients, never touches the PTY.
+- `{ "type": "view", "maximized": <bool> }` — maximize toggled; relayed the
+  same way so every tab shows the terminal at the same size.
 
 Server → client, disambiguated by frame type:
 
@@ -47,5 +51,6 @@ Server → client, disambiguated by frame type:
     stays open so a later respawn can reach this client.
   - `{ "type": "restart" }` — another client respawned the session; reset the
     terminal, new output follows.
+  - relayed `scroll` and `view` frames from the session's other clients.
 
 A restart from the client side is simply a new connection with the same key.

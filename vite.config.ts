@@ -98,6 +98,8 @@ function ptyServer(): Plugin {
       //   client -> server: text JSON
       //     { type: 'input', data: '<utf-8 keystrokes>' }
       //     { type: 'resize', cols: <int>, rows: <int> }
+      //     { type: 'scroll', ypos }   relayed to the session's other clients
+      //     { type: 'view', maximized } relayed to the session's other clients
       //   server -> client:
       //     binary frames: raw PTY output bytes (attaching clients first get
       //       the session's buffered scrollback the same way)
@@ -106,6 +108,7 @@ function ptyServer(): Plugin {
       //         open so a restart can reuse it
       //       { type: 'restart' }                another client respawned the
       //         session; reset the terminal, new output follows
+      //       relayed 'scroll' and 'view' frames from other clients
       wss.on('connection', (ws: any, req: any) => {
         const url = new URL(req.url ?? '', 'http://localhost')
         const cmd = url.searchParams.get('cmd') ?? ''
@@ -207,6 +210,14 @@ function ptyServer(): Plugin {
           if (isBinary) return
           try {
             const msg = JSON.parse(String(raw))
+            // View-state frames never touch the PTY; they just keep the other
+            // tabs on the same scroll position and maximize state.
+            if (msg.type === 'scroll' || msg.type === 'view') {
+              for (const c of s.clients) {
+                if (c !== ws && c.readyState === c.OPEN) c.send(String(raw))
+              }
+              return
+            }
             if (s.dead) return
             if (msg.type === 'input' && typeof msg.data === 'string') {
               s.pty.write(msg.data)

@@ -54,6 +54,19 @@ const castHost = ref<HTMLDivElement>()
 const started = ref(false)
 const exited = ref(false)
 const disconnected = ref(false)
+const maximized = ref(false)
+
+// Scroll and maximize state travel over the session so the audience tab
+// mirrors the presenter tab. The guard stops a relayed scroll from being
+// broadcast straight back.
+let suppressScroll = false
+let scrollTimer: ReturnType<typeof setTimeout> | undefined
+let pendingYpos: number | undefined
+
+function toggleMaximize() {
+  maximized.value = !maximized.value
+  sendJson({ type: 'view', maximized: maximized.value })
+}
 
 let term: Terminal | undefined
 let fitAddon: FitAddon | undefined
@@ -127,6 +140,21 @@ async function initTerm() {
 
   term.onData(d => sendJson({ type: 'input', data: d }))
   term.onResize(({ cols, rows }) => sendJson({ type: 'resize', cols, rows }))
+  // onScroll fires per line; trail it a little so a wheel flick is one or two
+  // frames on the wire instead of dozens.
+  term.onScroll((ypos) => {
+    if (suppressScroll)
+      return
+    pendingYpos = ypos
+    if (scrollTimer)
+      return
+    scrollTimer = setTimeout(() => {
+      scrollTimer = undefined
+      if (pendingYpos !== undefined)
+        sendJson({ type: 'scroll', ypos: pendingYpos })
+      pendingYpos = undefined
+    }, 40)
+  })
 
   resizeObserver = new ResizeObserver(() => {
     clearTimeout(resizeTimer)
@@ -177,6 +205,19 @@ function connect() {
         exited.value = false
         disconnected.value = false
         term?.reset()
+      } else if (msg.type === 'scroll') {
+        suppressScroll = true
+        try {
+          term?.scrollToLine(msg.ypos)
+        } finally {
+          suppressScroll = false
+        }
+      } else if (msg.type === 'view') {
+        // Follow the other tab's maximize state, but only while this slide is
+        // showing: an off-screen instance attached to the same session should
+        // come back at its own size.
+        if (isActive.value)
+          maximized.value = !!msg.maximized
       }
       return
     }
@@ -270,8 +311,17 @@ watch(showLive, (live) => {
 function onKeydown(e: KeyboardEvent) {
   if (!isActive.value)
     return
-  if (e.key === props.fallbackKey && props.cast && canLive.value) {
+  // Keys typed into the live shell bubble here too; a shortcut must not fire
+  // while the presenter is typing a command. The restart key is exempt: with
+  // the process gone, keystrokes reach no shell anyway.
+  const typingInShell = !!host.value && host.value.contains(e.target as Node)
+    && !exited.value && !disconnected.value
+  if (e.key === props.fallbackKey && props.cast && canLive.value && !typingInShell) {
     activeMode.value = activeMode.value === 'cast' ? 'live' : 'cast'
+    return
+  }
+  if (e.key === 'm' && showLive.value && !typingInShell) {
+    toggleMaximize()
     return
   }
   if (e.key === 'r' && activeMode.value === 'live' && started.value && (exited.value || disconnected.value))
@@ -294,11 +344,14 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="live-terminal">
+  <div class="live-terminal" :class="{ 'lt-max': maximized && showLive }">
     <!-- v-show, not v-if: toggling to the cast and back must not destroy the
          DOM xterm rendered into, or the terminal comes back blank. -->
     <div v-if="canLive" v-show="showLive" class="lt-live">
       <div ref="host" class="lt-host" />
+      <button class="lt-maxbtn" :title="maximized ? 'restore (m)' : 'maximize (m)'" @click="toggleMaximize">
+        {{ maximized ? '⤡' : '⤢' }}
+      </button>
       <div v-if="!started && !autoConnect" class="lt-overlay" @click="start">
         <span>click to start</span>
       </div>
@@ -322,6 +375,18 @@ onBeforeUnmount(() => {
   background: var(--ac-surface-lowest, #0d0d0d);
   display: flex;
   overflow: hidden;
+}
+
+/* position: fixed resolves against the slide canvas, not the browser window,
+   because Slidev scales slides with a CSS transform and a transformed
+   ancestor becomes the containing block. That is exactly the wanted effect:
+   maximize fills the slide, escapes the chrome's overflow clipping, and
+   scales with the projection. */
+.lt-max {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  padding: var(--ac-space-4, 14px);
 }
 
 .lt-live,
@@ -359,6 +424,26 @@ onBeforeUnmount(() => {
   justify-content: flex-end;
   padding: 0.5rem 0.75rem;
   background: none;
+}
+
+.lt-maxbtn {
+  position: absolute;
+  top: var(--ac-space-2, 0.5rem);
+  right: var(--ac-space-2, 0.5rem);
+  z-index: 1;
+  border: 0;
+  padding: 0 0.3rem;
+  background: none;
+  cursor: pointer;
+  font-size: 1rem;
+  line-height: 1.4;
+  color: var(--ac-on-surface-dim, #888);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.lt-live:hover .lt-maxbtn {
+  opacity: 0.8;
 }
 
 .lt-hint {
