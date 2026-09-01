@@ -1,0 +1,319 @@
+<script setup lang="ts">
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { useIsSlideActive, useSlideContext } from '@slidev/client'
+import type { Terminal } from '@xterm/xterm'
+import type { FitAddon } from '@xterm/addon-fit'
+
+const props = withDefaults(defineProps<{
+  cmd?: string
+  cast?: string
+  mode?: 'live' | 'cast'
+  fallbackKey?: string
+  fontSize?: number
+  rows?: number
+  cwd?: string
+  autoConnect?: boolean
+}>(), {
+  cmd: '',
+  mode: 'live',
+  fallbackKey: 'f',
+  fontSize: 14,
+  autoConnect: true,
+})
+
+const isDev = import.meta.env.DEV
+const { $renderContext } = useSlideContext()
+const isActive = useIsSlideActive()
+
+// Live only in 'slide' and 'presenter' render contexts: presenter mode also
+// mounts the next-slide preview ('previewNext'), which must not open a second
+// PTY for the same demo. PROD builds and exports never get the live branch.
+const liveFailed = ref(false)
+const canLive = computed(() =>
+  isDev
+  && !liveFailed.value
+  && ($renderContext.value === 'slide' || $renderContext.value === 'presenter'),
+)
+
+const activeMode = ref<'live' | 'cast'>(isDev ? props.mode : 'cast')
+watch(() => props.mode, (m) => { activeMode.value = m })
+
+const showLive = computed(() => canLive.value && activeMode.value === 'live')
+const showCast = computed(() =>
+  !!props.cast && (canLive.value ? activeMode.value === 'cast' : true))
+
+const host = ref<HTMLDivElement>()
+const castHost = ref<HTMLDivElement>()
+
+const started = ref(false)
+const exited = ref(false)
+const disconnected = ref(false)
+
+let term: Terminal | undefined
+let fitAddon: FitAddon | undefined
+let ws: WebSocket | undefined
+let everConnected = false
+let intentionalClose = false
+let resizeObserver: ResizeObserver | undefined
+let resizeTimer: ReturnType<typeof setTimeout> | undefined
+let initialized = false
+
+function cssVar(name: string, fallback: string) {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim()
+  return v || fallback
+}
+
+// xterm is imported lazily so PROD builds never load it and it lands in a
+// chunk fetched only when a live terminal actually initializes.
+async function initTerm() {
+  const [{ Terminal }, { FitAddon }] = await Promise.all([
+    import('@xterm/xterm'),
+    import('@xterm/addon-fit'),
+  ])
+  await import('@xterm/xterm/css/xterm.css')
+  if (!host.value)
+    return
+
+  const theme = {
+    background: cssVar('--ac-surface-lowest', '#0d0d0d'),
+    foreground: cssVar('--ac-on-surface', '#e6e6e6'),
+    cursor: cssVar('--ac-tertiary', '#7dd3fc'),
+    red: cssVar('--ac-error', '#ef4444'),
+    green: cssVar('--ac-success', '#22c55e'),
+    yellow: cssVar('--ac-warning', '#f59e0b'),
+  }
+  term = new Terminal({
+    theme,
+    fontFamily: cssVar('--ac-font-mono', 'monospace'),
+    fontSize: props.fontSize,
+    cursorBlink: true,
+    ...(props.rows !== undefined ? { rows: props.rows } : {}),
+  })
+  fitAddon = new FitAddon()
+  term.loadAddon(fitAddon)
+  term.open(host.value)
+  fitAddon.fit()
+
+  term.onData(d => sendJson({ type: 'input', data: d }))
+  term.onResize(({ cols, rows }) => sendJson({ type: 'resize', cols, rows }))
+
+  resizeObserver = new ResizeObserver(() => {
+    clearTimeout(resizeTimer)
+    resizeTimer = setTimeout(() => fitAddon?.fit(), 50)
+  })
+  resizeObserver.observe(host.value)
+}
+
+function sendJson(msg: Record<string, unknown>) {
+  if (ws && ws.readyState === WebSocket.OPEN)
+    ws.send(JSON.stringify(msg))
+}
+
+function connect() {
+  if (!term)
+    return
+  started.value = true
+  exited.value = false
+  disconnected.value = false
+  everConnected = false
+  intentionalClose = false
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  let url = `${proto}://${location.host}/__pty?cmd=${encodeURIComponent(props.cmd)}&cols=${term.cols}&rows=${term.rows}`
+  if (props.cwd)
+    url += `&cwd=${encodeURIComponent(props.cwd)}`
+
+  ws = new WebSocket(url)
+  ws.binaryType = 'arraybuffer'
+  ws.onopen = () => { everConnected = true }
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === 'string') {
+      const msg = JSON.parse(ev.data)
+      if (msg.type === 'exit') {
+        exited.value = true
+        term?.write(`\r\n\x1b[2m[process exited (code ${msg.exitCode}), press r or click to restart]\x1b[0m`)
+      }
+      return
+    }
+    term?.write(new Uint8Array(ev.data as ArrayBuffer))
+  }
+  ws.onclose = () => {
+    if (intentionalClose)
+      return
+    if (!everConnected) {
+      // First connect never succeeded (no pty-server plugin, most likely):
+      // drop to the cast if one exists, otherwise the placeholder.
+      liveFailed.value = true
+      if (props.cast)
+        activeMode.value = 'cast'
+      return
+    }
+    if (!exited.value) {
+      disconnected.value = true
+      term?.write('\r\n\x1b[2m[disconnected, press r or click to restart]\x1b[0m')
+    }
+  }
+  ws.onerror = () => { /* onclose follows and handles it */ }
+}
+
+function closeWs() {
+  if (ws) {
+    intentionalClose = true
+    ws.close()
+    ws = undefined
+  }
+}
+
+function restart() {
+  closeWs()
+  term?.reset()
+  connect()
+}
+
+function start() {
+  if (!started.value)
+    connect()
+}
+
+// Do NOT connect in onMounted: Slidev mounts adjacent slides too. First
+// activation is the trigger; deactivation keeps the session alive so the
+// presenter can flip back mid-demo. flush: 'post' is load bearing here and
+// on the cast watch below — both host divs exist only on conditional
+// template branches, so with the default 'pre' flush these callbacks would
+// run before the branch rendered and find the ref still undefined.
+watch([isActive, activeMode], async ([active]) => {
+  if (!active || !canLive.value || activeMode.value !== 'live' || initialized)
+    return
+  initialized = true
+  await initTerm()
+  if (props.autoConnect)
+    connect()
+}, { immediate: true, flush: 'post' })
+
+let player: { dispose: () => void } | undefined
+
+// asciinema-player is imported lazily for the same reason as xterm.
+async function mountCast() {
+  player?.dispose()
+  player = undefined
+  if (activeMode.value !== 'cast' || !props.cast || !castHost.value)
+    return
+  const AsciinemaPlayer = await import('asciinema-player')
+  await import('asciinema-player/dist/bundle/asciinema-player.css')
+  player = AsciinemaPlayer.create(props.cast, castHost.value, {
+    autoPlay: true,
+    loop: true,
+    controls: false,
+    fit: 'both',
+  })
+}
+
+watch([activeMode, () => props.cast], mountCast, { flush: 'post' })
+
+// Gated on isActive, unlike Frame.vue's global listener: a deck can hold
+// several LiveTerminals, and an ungated listener would toggle off-screen ones.
+function onKeydown(e: KeyboardEvent) {
+  if (!isActive.value)
+    return
+  if (e.key === props.fallbackKey && props.cast && canLive.value) {
+    activeMode.value = activeMode.value === 'cast' ? 'live' : 'cast'
+    return
+  }
+  if (e.key === 'r' && activeMode.value === 'live' && started.value && (exited.value || disconnected.value))
+    restart()
+}
+
+onMounted(() => {
+  mountCast()
+  window.addEventListener('keydown', onKeydown)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onKeydown)
+  clearTimeout(resizeTimer)
+  resizeObserver?.disconnect()
+  closeWs()
+  term?.dispose()
+  player?.dispose()
+})
+</script>
+
+<template>
+  <div class="live-terminal">
+    <!-- v-show, not v-if: toggling to the cast and back must not destroy the
+         DOM xterm rendered into, or the terminal comes back blank. -->
+    <div v-if="canLive" v-show="showLive" class="lt-live">
+      <div ref="host" class="lt-host" />
+      <div v-if="!started && !autoConnect" class="lt-overlay" @click="start">
+        <span>click to start</span>
+      </div>
+      <div v-else-if="exited || disconnected" class="lt-overlay lt-overlay-restart" @click="restart">
+        <span>restart</span>
+      </div>
+    </div>
+    <div v-if="showCast" ref="castHost" class="lt-cast" />
+    <div v-if="!showLive && !showCast" class="lt-placeholder">
+      <span>demo runs live, no recording attached</span>
+    </div>
+    <span v-if="cast && isDev" class="lt-hint">press {{ fallbackKey }} for {{ activeMode === 'cast' ? 'live' : 'cast' }}</span>
+  </div>
+</template>
+
+<style scoped>
+.live-terminal {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  background: var(--ac-surface-lowest, #0d0d0d);
+  display: flex;
+  overflow: hidden;
+}
+
+.lt-live,
+.lt-host,
+.lt-cast {
+  position: relative;
+  width: 100%;
+  height: 100%;
+}
+
+.lt-host :deep(.xterm) {
+  height: 100%;
+}
+
+.lt-placeholder {
+  margin: auto;
+  color: var(--ac-on-surface-dim, #888);
+  font-family: var(--ac-font-mono, monospace);
+}
+
+.lt-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--ac-on-surface-dim, #888);
+  font-family: var(--ac-font-mono, monospace);
+  background: color-mix(in srgb, var(--ac-surface-lowest, #0d0d0d) 40%, transparent);
+}
+
+.lt-overlay-restart {
+  align-items: flex-end;
+  justify-content: flex-end;
+  padding: 0.5rem 0.75rem;
+  background: none;
+}
+
+.lt-hint {
+  position: absolute;
+  bottom: var(--ac-space-2, 0.5rem);
+  right: var(--ac-space-3, 0.75rem);
+  font-family: var(--ac-font-mono, monospace);
+  font-size: var(--ac-text-label, 0.7rem);
+  color: var(--ac-on-surface-dim, #888);
+  opacity: 0.6;
+  pointer-events: none;
+}
+</style>
