@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { useIsSlideActive, useSlideContext } from '@slidev/client'
+import { useIsSlideActive, useNav, useSlideContext } from '@slidev/client'
 import type { Terminal } from '@xterm/xterm'
 import type { FitAddon } from '@xterm/addon-fit'
 
@@ -24,6 +24,7 @@ const props = withDefaults(defineProps<{
 const isDev = import.meta.env.DEV
 const { $renderContext } = useSlideContext()
 const isActive = useIsSlideActive()
+const nav = useNav()
 
 // Live only in 'slide' and 'presenter' render contexts: presenter mode also
 // mounts the next-slide preview ('previewNext'), which must not open a second
@@ -96,11 +97,21 @@ async function initTerm() {
 
   // No focus on init: a freshly shown slide must keep its keyboard on Slidev
   // navigation, not swallow arrows and space into the shell. The presenter
-  // clicks the terminal to type. While it is focused, PageUp/PageDown are left
-  // unhandled so they bubble to Slidev and a clicker still advances the deck.
+  // clicks the terminal to type. While any input has focus (the terminal's
+  // hidden textarea counts), Slidev disables every shortcut of its own, so
+  // merely letting PageUp/PageDown bubble is not enough: drive the deck's nav
+  // directly. Clickers send exactly these two keys.
   term.attachCustomKeyEventHandler((e) => {
-    if (e.key === 'PageUp' || e.key === 'PageDown')
+    if (e.key === 'PageUp' || e.key === 'PageDown') {
+      if (e.type === 'keydown') {
+        e.preventDefault()
+        if (e.key === 'PageDown')
+          nav.next()
+        else
+          nav.prev()
+      }
       return false
+    }
     return true
   })
 
