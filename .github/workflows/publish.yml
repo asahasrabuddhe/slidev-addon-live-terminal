@@ -38,5 +38,9 @@ jobs:
             exit 1
           fi
 
+      # --provenance records a signed attestation linking this published
+      # version to this repo, commit, and workflow run. Trusted publishing
+      # supplies the OIDC identity it needs; the repository field in
+      # package.json must match, which it does.
       - name: publish
-        run: npm publish
+        run: npm publish --provenance
