@@ -93,7 +93,16 @@ async function initTerm() {
   term.loadAddon(fitAddon)
   term.open(host.value)
   fitAddon.fit()
-  term.focus()
+
+  // No focus on init: a freshly shown slide must keep its keyboard on Slidev
+  // navigation, not swallow arrows and space into the shell. The presenter
+  // clicks the terminal to type. While it is focused, PageUp/PageDown are left
+  // unhandled so they bubble to Slidev and a clicker still advances the deck.
+  term.attachCustomKeyEventHandler((e) => {
+    if (e.key === 'PageUp' || e.key === 'PageDown')
+      return false
+    return true
+  })
 
   term.onData(d => sendJson({ type: 'input', data: d }))
   term.onResize(({ cols, rows }) => sendJson({ type: 'resize', cols, rows }))
